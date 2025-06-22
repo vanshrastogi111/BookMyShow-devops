@@ -1,0 +1,143 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node23'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
+    }
+
+    stages {
+
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'main', url: 'https://github.com/vanshrastogi111/BookMyShow-devops.git'
+                sh 'ls -la'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh '''
+                    echo "🔍 Starting SonarQube scan..."
+                    $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=BMS \
+                        -Dsonar.projectKey=BMS
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                echo "📦 Installing Node.js dependencies..."
+                if [ -f package.json ]; then
+                    rm -rf node_modules package-lock.json
+                    npm install
+                else
+                    echo "❌ Error: package.json not found"
+                    exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('OWASP FS Scan') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DC'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+                sh '''
+                echo "🔐 Running Trivy scan..."
+                trivy fs . > trivyfs.txt
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                echo "🐳 Building Docker image..."
+                docker build --no-cache -t vanshrastogi111/bms:latest .
+                docker images
+                '''
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                withDockerRegistry(credentialsId: 'docker-cred', url: 'https://index.docker.io/v1/') {
+                    sh '''
+                    echo "📤 Pushing Docker image to DockerHub..."
+                    docker push vanshrastogi111/bms:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Container (Local - Optional)') {
+            when {
+                expression {
+                    // Optional local container deploy, skip if deploying to k8s
+                    return false
+                }
+            }
+            steps {
+                sh '''
+                echo "🚀 Stopping and removing old container..."
+                docker stop bms || true
+                docker rm bms || true
+
+                echo "🆕 Running new container on port 3000..."
+                docker run -d --restart=always --name bms -p 3000:3000 vanshrastogi111/bms:latest
+
+                echo "🧪 Checking running containers..."
+                docker ps -a
+
+                echo "📜 Fetching logs..."
+                sleep 5
+                docker logs bms
+                '''
+            }
+        }
+
+        stage('Kubernetes Deploy') {
+            steps {
+                sh '''
+                echo "🚀 Deploying to Kubernetes..."
+
+                # OPTIONAL: Replace image dynamically in deployment.yml
+                sed -i 's|image:.*|image: vanshrastogi111/bms:latest|' deployment.yml
+
+                echo "📦 Applying manifests..."
+                kubectl apply -f deployment.yml
+                kubectl apply -f service.yml
+
+                echo "⏳ Waiting for rollout..."
+                kubectl rollout status deployment/bms-app
+
+                echo "✅ Fetching service info:"
+                kubectl get svc bms-service
+                '''
+            }
+        }
+    }
+}
